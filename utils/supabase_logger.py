@@ -10,7 +10,7 @@ try:
 except ImportError:
     SUPABASE_AVAILABLE = False
 
-# Load environment variables
+# Load environment variable
 load_dotenv()
 
 
