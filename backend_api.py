@@ -49,6 +49,8 @@ class QueryResponse(BaseModel):
     execution_time: Optional[float] = None
     query_id: Optional[str] = None
     rephrased_query: Optional[str] = None
+    response_type: Optional[str] = "data"  # "data" or "conversational"
+    intent: Optional[str] = None
 
 
 class APIKeyRequest(BaseModel):
@@ -566,10 +568,28 @@ async def process_query(
         # Calculate execution time
         execution_time = (datetime.now() - start_time).total_seconds()
 
+        # Check if this is a conversational or visualization response
+        response_type = result.get("response_type", "data")
+        
         # Prepare result for JSON serialization
         processed_result = None
         if result["success"] and result["result"] is not None:
-            if isinstance(result["result"], pd.DataFrame):
+            # Handle conversational responses (text/paragraph format)
+            if response_type == "conversational":
+                processed_result = {
+                    "type": "text",
+                    "data": str(result["result"]),
+                    "intent": result.get("intent", "conversational"),
+                }
+            # Handle visualization responses (chart configuration)
+            elif response_type == "visualization":
+                processed_result = {
+                    "type": "visualization",
+                    "data": result["result"],  # Chart configuration from LLM
+                    "intent": result.get("intent", "visualization"),
+                    "chart_reasoning": result.get("chart_reasoning", ""),
+                }
+            elif isinstance(result["result"], pd.DataFrame):
                 # Check if DataFrame is empty
                 if result["result"].empty:
                     processed_result = {
@@ -672,6 +692,8 @@ async def process_query(
             execution_time=execution_time,
             query_id=query_id,
             rephrased_query=result.get("rephrased_query"),
+            response_type=result.get("response_type", "data"),
+            intent=result.get("intent"),
         )
 
     except HTTPException:
