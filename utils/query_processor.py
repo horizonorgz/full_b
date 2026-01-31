@@ -428,16 +428,22 @@ class QueryProcessor:
             Dict containing success status, result, code, and error if any
         """
         generated_code = ""
+        rephrased_query = query
         try:
-            # Generate pandas code using Groq
-            generated_code = self._generate_pandas_code(df, query, groq_client)
+            # First, rephrase the query to be more precise using DataFrame metadata
+            rephrased_query = self._rephrase_query(df, query, groq_client)
+            
+            # Generate pandas code using the rephrased query
+            generated_code = self._generate_pandas_code(df, rephrased_query, groq_client)
             
             if not generated_code:
                 return {
                     'success': False,
                     'error': 'Failed to generate pandas code',
                     'code': '',
-                    'result': None
+                    'result': None,
+                    'original_query': query,
+                    'rephrased_query': rephrased_query
                 }
             
             # Validate and execute the code
@@ -447,7 +453,9 @@ class QueryProcessor:
                 'success': True,
                 'result': result,
                 'code': generated_code,
-                'error': None
+                'error': None,
+                'original_query': query,
+                'rephrased_query': rephrased_query
             }
             
         except Exception as e:
@@ -455,7 +463,9 @@ class QueryProcessor:
                 'success': False,
                 'error': str(e),
                 'code': generated_code,
-                'result': None
+                'result': None,
+                'original_query': query,
+                'rephrased_query': rephrased_query
             }
     
     def process_query_with_fuzzy_matching(self, df: pd.DataFrame, query: str, 
@@ -661,6 +671,154 @@ class QueryProcessor:
                 dataset_id
             )
     
+    def _rephrase_query(self, df: pd.DataFrame, query: str, groq_client) -> str:
+        """
+        Rephrase a vague query into a precise, structured query using DataFrame metadata.
+        
+        Examples:
+        - "give me value for nic code 123 and which is orally taken" 
+          -> "What is the value where nic_code equals 123 and consumption equals 'oral'?"
+        - "show products in electronics that cost less than 500"
+          -> "Show all products where category equals 'Electronics' and price is less than 500"
+        
+        Args:
+            df: Input DataFrame for context
+            query: Original user query
+            groq_client: Groq client instance
+            
+        Returns:
+            Rephrased query string
+        """
+        try:
+            # Get column names and sample values for context
+            column_info = self._get_column_metadata(df)
+            
+            # Create the rephrasing prompt
+            rephrase_prompt = f"""You are a query clarification assistant. Your job is to rephrase vague or informal user queries into clear, precise queries that map to database columns.
+
+DATASET METADATA:
+{column_info}
+
+USER'S ORIGINAL QUERY: "{query}"
+
+INSTRUCTIONS:
+1. Identify what the user is asking for (which columns/values they want)
+2. Map informal terms to actual column names from the metadata above
+3. Rephrase the query to be clear and precise, using actual column names
+4. Keep the same intent but make it unambiguous
+5. If the query is already clear, return it as-is with minor improvements
+
+EXAMPLES:
+- "give me value for nic code 123 and orally taken" → "Show records where NIC_Code equals 123 and Consumption_Type equals 'Oral'"
+- "products under 500 in electronics" → "Show all products where Category equals 'Electronics' and Price is less than 500"
+- "highest selling items last month" → "Show items with highest Sales for the last month, sorted by Sales descending"
+
+Return ONLY the rephrased query, nothing else. Do not include explanations or code.
+
+REPHRASED QUERY:"""
+
+            # Get response from Groq
+            response = groq_client.generate_code(rephrase_prompt)
+            
+            # Clean up the response
+            rephrased = response.strip()
+            
+            # Remove quotes if wrapped
+            if (rephrased.startswith('"') and rephrased.endswith('"')) or \
+               (rephrased.startswith("'") and rephrased.endswith("'")):
+                rephrased = rephrased[1:-1]
+            
+            # If rephrasing failed or returned empty, use original
+            if not rephrased or len(rephrased) < 5:
+                return query
+            
+            # Log the rephrasing for debugging
+            import sys as _sys
+            _sys.stderr.write(f"\n🔄 Query Rephrasing:\n")
+            _sys.stderr.write(f"   Original: {query}\n")
+            _sys.stderr.write(f"   Rephrased: {rephrased}\n")
+            _sys.stderr.flush()
+            
+            return rephrased
+            
+        except Exception as e:
+            # If rephrasing fails, just use the original query
+            import sys as _sys
+            _sys.stderr.write(f"⚠️ Query rephrasing failed: {e}, using original query\n")
+            _sys.stderr.flush()
+            return query
+    
+    def _get_column_metadata(self, df: pd.DataFrame) -> str:
+        """
+        Generate detailed column metadata for query rephrasing.
+        Includes column names, types, and sample values.
+        """
+        metadata_lines = []
+        metadata_lines.append("COLUMNS AND THEIR DETAILS:")
+        
+        for col in df.columns:
+            col_type = str(df[col].dtype)
+            unique_count = df[col].nunique()
+            
+            # Get sample values (up to 5 unique values for categorical, or range for numeric)
+            if df[col].dtype == 'object' or unique_count <= 10:
+                sample_values = df[col].dropna().unique()[:5].tolist()
+                sample_str = f"Sample values: {sample_values}"
+            elif pd.api.types.is_numeric_dtype(df[col]):
+                min_val = df[col].min()
+                max_val = df[col].max()
+                sample_str = f"Range: {min_val} to {max_val}"
+            else:
+                sample_str = f"Unique values: {unique_count}"
+            
+            # Add common alternative names/aliases
+            col_lower = col.lower().replace('_', ' ').replace('-', ' ')
+            metadata_lines.append(f"  - Column: '{col}' (type: {col_type})")
+            metadata_lines.append(f"    {sample_str}")
+            
+            # Suggest possible user terms for this column
+            possible_terms = self._generate_column_aliases(col)
+            if possible_terms:
+                metadata_lines.append(f"    User might refer to this as: {possible_terms}")
+        
+        return "\n".join(metadata_lines)
+    
+    def _generate_column_aliases(self, column_name: str) -> str:
+        """Generate possible user terms for a column name"""
+        aliases = []
+        col_lower = column_name.lower()
+        
+        # Common mappings
+        alias_mappings = {
+            'nic': ['nic code', 'nic-code', 'niccode'],
+            'code': ['code', 'id', 'number'],
+            'consumption': ['consumption', 'taken', 'how taken', 'method'],
+            'oral': ['oral', 'orally', 'by mouth'],
+            'price': ['price', 'cost', 'amount', 'value'],
+            'category': ['category', 'type', 'kind', 'section'],
+            'name': ['name', 'title', 'label'],
+            'date': ['date', 'time', 'when'],
+            'quantity': ['quantity', 'qty', 'count', 'number', 'amount'],
+            'status': ['status', 'state', 'condition'],
+        }
+        
+        for key, terms in alias_mappings.items():
+            if key in col_lower:
+                aliases.extend([t for t in terms if t not in aliases])
+        
+        # Add variations of the column name itself
+        variations = [
+            col_lower,
+            col_lower.replace('_', ' '),
+            col_lower.replace('-', ' '),
+            col_lower.replace('_', ''),
+        ]
+        for v in variations:
+            if v not in aliases:
+                aliases.append(v)
+        
+        return ', '.join(aliases[:5]) if aliases else ''
+
     def _generate_pandas_code(self, df: pd.DataFrame, query: str, groq_client) -> str:
         """Generate pandas code using Groq LLM"""
         try:
@@ -911,6 +1069,13 @@ Your code:
     def _execute_safe_code(self, df: pd.DataFrame, code: str) -> Any:
         """Safely execute pandas code"""
         try:
+            # Debug: Log the actual code being executed
+            import sys as _debug_sys
+            _debug_sys.stderr.write(f"\n{'='*50}\n")
+            _debug_sys.stderr.write(f"📝 Code to execute:\n{code}\n")
+            _debug_sys.stderr.write(f"{'='*50}\n")
+            _debug_sys.stderr.flush()
+            
             # Create safe built-ins dictionary
             safe_builtins_dict = {}
             for name in self.safe_builtins:
@@ -949,12 +1114,73 @@ Your code:
             # Determine if code is multi-line or single expression
             is_multiline = '\n' in code.strip() or ';' in code
             
+            # Check if it's a multi-line expression (chained methods) vs multi-statement
+            # Multi-line expressions start with df. or df[ and are chained method calls
+            code_stripped = code.strip()
+            first_line = code_stripped.split('\n')[0].strip()
+            
+            # Check for assignment at the start (like "result = df..." or "x = df...")
+            # But not for things like ".assign(col=..." which are method calls
+            has_variable_assignment = (
+                '=' in first_line and 
+                not first_line.startswith('df') and
+                not first_line.startswith('.')
+            )
+            
+            # Check if code starts with df (any accessor like df., df[, df(, etc.)
+            starts_with_df = code_stripped.startswith('df')
+            
+            is_chained_expression = (
+                is_multiline and 
+                starts_with_df and
+                not has_variable_assignment and
+                not any(line.strip().startswith(('result ', 'result=', 'output ', 'output=', 
+                                                  'answer ', 'answer=', 'import ', 'print('))
+                       for line in code_stripped.split('\n'))
+            )
+            
+            # Debug logging to stderr (won't be captured by stdout redirect)
+            import sys as _sys
+            _sys.stderr.write(f"🔍 Code execution debug:\n")
+            _sys.stderr.write(f"   is_multiline: {is_multiline}\n")
+            _sys.stderr.write(f"   starts_with_df: {starts_with_df}\n")
+            _sys.stderr.write(f"   is_chained_expression: {is_chained_expression}\n")
+            _sys.stderr.write(f"   first_line: {first_line[:80]}...\n")
+            _sys.stderr.write(f"   has_variable_assignment: {has_variable_assignment}\n")
+            _sys.stderr.flush()
+            
             # Capture stdout for operations that print
             old_stdout = sys.stdout
             sys.stdout = captured_output = StringIO()
             
             try:
-                if is_multiline:
+                if is_chained_expression:
+                    # Multi-line chained expression - wrap and use eval
+                    # Join the lines and try to evaluate as single expression
+                    single_line_code = ' '.join(line.strip() for line in code_stripped.split('\n'))
+                    _sys.stderr.write(f"   Trying eval with joined code...\n")
+                    _sys.stderr.flush()
+                    try:
+                        compile(single_line_code, '<string>', 'eval')
+                        result = eval(single_line_code, safe_globals, {})
+                        _sys.stderr.write(f"   ✅ Eval succeeded, result type: {type(result)}\n")
+                        _sys.stderr.flush()
+                        return result
+                    except SyntaxError as se:
+                        _sys.stderr.write(f"   Eval failed with SyntaxError: {se}, trying wrapped exec...\n")
+                        _sys.stderr.flush()
+                        # Fall back to exec with result capture
+                        wrapped_code = f"__result__ = (\n{code_stripped}\n)"
+                        local_namespace = {}
+                        exec(wrapped_code, safe_globals, local_namespace)
+                        if '__result__' in local_namespace:
+                            return local_namespace['__result__']
+                        # If still no result, the code might be invalid
+                        raise Exception("Failed to capture result from chained expression")
+                        
+                elif is_multiline:
+                    _sys.stderr.write(f"   ⚠️ Going into is_multiline branch (not chained)\n")
+                    _sys.stderr.flush()
                     # Multi-line code - use exec
                     try:
                         compile(code, '<string>', 'exec')
@@ -964,6 +1190,9 @@ Your code:
                     # Create a local namespace to capture results
                     local_namespace = {}
                     exec(code, safe_globals, local_namespace)
+                    
+                    _sys.stderr.write(f"   local_namespace keys: {list(local_namespace.keys())}\n")
+                    _sys.stderr.flush()
                     
                     # Check for printed output first
                     printed_output = captured_output.getvalue()

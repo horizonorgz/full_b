@@ -48,6 +48,7 @@ class QueryResponse(BaseModel):
     error: Optional[str] = None
     execution_time: Optional[float] = None
     query_id: Optional[str] = None
+    rephrased_query: Optional[str] = None
 
 
 class APIKeyRequest(BaseModel):
@@ -569,30 +570,70 @@ async def process_query(
         processed_result = None
         if result["success"] and result["result"] is not None:
             if isinstance(result["result"], pd.DataFrame):
-                # Convert DataFrame to JSON-serializable format
-                processed_result = {
-                    "type": "dataframe",
-                    "columns": result["result"].columns.tolist(),
-                    "data": result["result"]
-                    .head(100)
-                    .values.tolist(),  # Limit to 100 rows
-                    "shape": list(result["result"].shape),
-                }
+                # Check if DataFrame is empty
+                if result["result"].empty:
+                    processed_result = {
+                        "type": "message",
+                        "data": "No matching data found for your query. The filter conditions returned an empty result.",
+                    }
+                else:
+                    # Convert DataFrame to JSON-serializable format
+                    # Handle NaN values by replacing them with None for JSON serialization
+                    df_result = result["result"].head(100).fillna("N/A")
+                    processed_result = {
+                        "type": "dataframe",
+                        "columns": result["result"].columns.tolist(),
+                        "data": df_result.values.tolist(),
+                        "shape": list(result["result"].shape),
+                    }
             elif isinstance(result["result"], pd.Series):
-                processed_result = {
-                    "type": "series",
-                    "data": result["result"].head(100).tolist(),
-                    "index": result["result"].head(100).index.tolist(),
-                    "name": result["result"].name,
-                }
+                # Check if Series is empty
+                if result["result"].empty:
+                    processed_result = {
+                        "type": "message",
+                        "data": "No matching data found for your query. The filter conditions returned an empty result.",
+                    }
+                else:
+                    # Handle NaN values and convert to JSON-serializable format
+                    series_result = result["result"].head(100)
+                    # Convert values to native Python types, handling NaN
+                    data_values = []
+                    for val in series_result.values:
+                        if pd.isna(val):
+                            data_values.append(None)
+                        elif isinstance(val, (np.floating, np.integer)):
+                            data_values.append(float(val) if not np.isnan(val) else None)
+                        else:
+                            data_values.append(val)
+                    
+                    # Convert index to native Python types
+                    index_values = []
+                    for idx in series_result.index:
+                        if pd.isna(idx):
+                            index_values.append(str(idx))
+                        else:
+                            index_values.append(str(idx) if not isinstance(idx, (int, float)) else idx)
+                    
+                    processed_result = {
+                        "type": "series",
+                        "data": data_values,
+                        "index": index_values,
+                        "name": result["result"].name,
+                    }
             elif isinstance(result["result"], pd.Index):
                 # Handle pandas Index objects (like column names)
-                processed_result = {
-                    "type": "series",
-                    "data": list(range(len(result["result"]))),
-                    "index": result["result"].tolist(),
-                    "name": "Column Names",
-                }
+                if len(result["result"]) == 0:
+                    processed_result = {
+                        "type": "message",
+                        "data": "No matching data found for your query.",
+                    }
+                else:
+                    processed_result = {
+                        "type": "series",
+                        "data": list(range(len(result["result"]))),
+                        "index": result["result"].tolist(),
+                        "name": "Column Names",
+                    }
             else:
                 processed_result = {"type": "scalar", "data": str(result["result"])}
 
@@ -630,6 +671,7 @@ async def process_query(
             error=result.get("error"),
             execution_time=execution_time,
             query_id=query_id,
+            rephrased_query=result.get("rephrased_query"),
         )
 
     except HTTPException:
