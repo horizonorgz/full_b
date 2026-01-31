@@ -115,6 +115,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:3001",
         "https://h-frontend-one.vercel.app",
+        "https://full-jet.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
