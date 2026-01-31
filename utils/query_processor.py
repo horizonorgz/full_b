@@ -721,201 +721,434 @@ class QueryProcessor:
             'data_suitable': True
         }
     
+    # ========================================================================
+    # NEW VISUALIZATION ARCHITECTURE: 4-PHASE APPROACH
+    # Phase 1: Data Analyst (Generate Pandas code)
+    # Phase 2: Execution Sandbox (Run code, get clean DataFrame)
+    # Phase 3: Visualization Architect (Heuristic chart selection)
+    # Phase 4: Renderer (Generate Plotly-compatible JSON)
+    # ========================================================================
+    
+    def _generate_viz_data_code(self, df: pd.DataFrame, query: str, 
+                                 groq_client) -> str:
+        """
+        PHASE 1: Data Analyst
+        Ask LLM to write Pandas code to prepare data for visualization.
+        The LLM should NOT draw charts - only prepare the data.
+        """
+        import sys as _sys
+        
+        # Get column info
+        columns_info = []
+        for col in df.columns:
+            dtype = str(df[col].dtype)
+            nunique = df[col].nunique()
+            sample = df[col].dropna().head(3).tolist()
+            columns_info.append(f"  - '{col}' ({dtype}, {nunique} unique values, sample: {sample[:3]})")
+        
+        columns_str = "\n".join(columns_info)
+        
+        prompt = f"""You are a data analyst. Write Pandas code to prepare data for a visualization.
+
+DATASET SCHEMA:
+{columns_str}
+
+Total rows: {len(df)}
+
+USER REQUEST: "{query}"
+
+TASK: Write Python code that creates a variable called `viz_data` - a small, clean DataFrame ready for plotting.
+
+RULES:
+1. Start with `viz_data = ` - this variable will be used for charting
+2. Use groupby, aggregation, filtering, or binning as needed
+3. Keep viz_data small (max 20 rows for bar/pie, 100 for scatter/line)
+4. For continuous numeric columns, consider binning with pd.cut()
+5. Reset index if using groupby: .reset_index()
+6. Convert any interval/period types to strings for JSON compatibility
+7. Handle missing values with .dropna() or .fillna()
+8. DO NOT import anything - pandas is already available as 'df'
+9. DO NOT create any plots - only prepare the data
+
+EXAMPLES:
+- "sales by category" → viz_data = df.groupby('Category')['Sales'].sum().reset_index()
+- "top 5 products by price" → viz_data = df.nlargest(5, 'Price')[['Name', 'Price']]
+- "price distribution" → viz_data = df['Price'].value_counts().head(10).reset_index()
+- "temperature vs failure" → temp_bins = pd.cut(df['Temperature'], bins=10); viz_data = df.groupby(temp_bins)['Failure'].mean().reset_index(); viz_data['Temperature'] = viz_data['Temperature'].astype(str)
+
+YOUR CODE (only the code, no explanations):
+"""
+        
+        code = groq_client.generate_code(prompt)
+        
+        # Clean the code
+        if code:
+            code = code.strip()
+            # Remove markdown code blocks
+            if code.startswith('```python'):
+                code = code[9:]
+            elif code.startswith('```'):
+                code = code[3:]
+            if code.endswith('```'):
+                code = code[:-3]
+            code = code.strip()
+        
+        _sys.stderr.write(f"📊 Phase 1 - Data Prep Code:\n{code}\n")
+        _sys.stderr.flush()
+        
+        return code
+    
+    def _execute_viz_code(self, df: pd.DataFrame, code: str) -> pd.DataFrame:
+        """
+        PHASE 2: Execution Sandbox
+        Execute the generated code and return the viz_data DataFrame.
+        Includes safety checks and downsampling.
+        """
+        import sys as _sys
+        
+        if not code:
+            return None
+        
+        try:
+            # Create execution namespace
+            local_vars = {'df': df, 'pd': pd, 'np': np}
+            
+            # Execute the code
+            exec(code, {'pd': pd, 'np': np, '__builtins__': {}}, local_vars)
+            
+            viz_data = local_vars.get('viz_data')
+            
+            if viz_data is None:
+                _sys.stderr.write("⚠️ Phase 2: viz_data not found in executed code\n")
+                _sys.stderr.flush()
+                return None
+            
+            # Convert to DataFrame if it's a Series
+            if isinstance(viz_data, pd.Series):
+                viz_data = viz_data.reset_index()
+            
+            # Downsample if too large
+            if len(viz_data) > 100:
+                _sys.stderr.write(f"⚠️ Phase 2: Downsampling from {len(viz_data)} to 100 rows\n")
+                viz_data = viz_data.head(100)
+            
+            _sys.stderr.write(f"✅ Phase 2 - viz_data shape: {viz_data.shape}\n")
+            _sys.stderr.write(f"   Columns: {list(viz_data.columns)}\n")
+            _sys.stderr.write(f"   Preview:\n{viz_data.head(5).to_string()}\n")
+            _sys.stderr.flush()
+            
+            return viz_data
+            
+        except Exception as e:
+            _sys.stderr.write(f"❌ Phase 2 - Execution error: {e}\n")
+            _sys.stderr.flush()
+            return None
+    
+    def _select_chart_type(self, viz_data: pd.DataFrame, query: str) -> Dict[str, Any]:
+        """
+        PHASE 3: Visualization Architect
+        Use heuristics to determine the best chart type based on the prepared data.
+        """
+        import sys as _sys
+        query_lower = query.lower()
+        
+        if viz_data is None or len(viz_data) == 0:
+            return {'chart_type': 'bar', 'x_col': None, 'y_col': None, 'reasoning': 'Default'}
+        
+        cols = viz_data.columns.tolist()
+        numeric_cols = viz_data.select_dtypes(include=['number']).columns.tolist()
+        categorical_cols = viz_data.select_dtypes(include=['object', 'category']).columns.tolist()
+        
+        # Check for explicit chart type in query
+        explicit_types = {
+            'pie': 'pie', 'donut': 'donut', 'scatter': 'scatter',
+            'line': 'line', 'bar': 'bar', 'histogram': 'histogram'
+        }
+        for keyword, chart_type in explicit_types.items():
+            if keyword in query_lower:
+                x_col = categorical_cols[0] if categorical_cols else cols[0]
+                y_col = numeric_cols[0] if numeric_cols else cols[-1]
+                return {'chart_type': chart_type, 'x_col': x_col, 'y_col': y_col, 
+                        'reasoning': f'Explicit {chart_type} requested'}
+        
+        # Heuristic selection based on data types
+        if len(cols) >= 2:
+            x_col = cols[0]
+            y_col = cols[1] if len(cols) > 1 else cols[0]
+            
+            x_is_numeric = x_col in numeric_cols
+            y_is_numeric = y_col in numeric_cols
+            
+            # Categorical X, Numeric Y → Bar Chart
+            if not x_is_numeric and y_is_numeric:
+                chart_type = 'bar'
+                reasoning = f"Categorical '{x_col}' x Numeric '{y_col}' → Bar Chart"
+            
+            # Both Numeric → Scatter or Line
+            elif x_is_numeric and y_is_numeric:
+                # Check if X looks like a sequence (for line chart)
+                if 'time' in x_col.lower() or 'date' in x_col.lower() or 'index' in x_col.lower():
+                    chart_type = 'line'
+                    reasoning = f"Time/sequence '{x_col}' x Numeric '{y_col}' → Line Chart"
+                else:
+                    chart_type = 'scatter'
+                    reasoning = f"Numeric '{x_col}' x Numeric '{y_col}' → Scatter Plot"
+            
+            # Single column or both categorical
+            else:
+                chart_type = 'bar'
+                reasoning = "Default to Bar Chart"
+        
+        elif len(cols) == 1:
+            x_col = cols[0]
+            y_col = 'count'
+            if x_col in numeric_cols:
+                chart_type = 'histogram'
+                reasoning = f"Single numeric column '{x_col}' → Histogram"
+            else:
+                chart_type = 'bar'
+                reasoning = f"Single categorical column '{x_col}' → Bar Chart (counts)"
+        
+        else:
+            chart_type = 'bar'
+            x_col, y_col = None, None
+            reasoning = "No columns found, default to Bar"
+        
+        _sys.stderr.write(f"📊 Phase 3 - Chart Selection: {chart_type}\n")
+        _sys.stderr.write(f"   X: {x_col}, Y: {y_col}\n")
+        _sys.stderr.write(f"   Reasoning: {reasoning}\n")
+        _sys.stderr.flush()
+        
+        return {'chart_type': chart_type, 'x_col': x_col, 'y_col': y_col, 'reasoning': reasoning}
+    
+    def _generate_chart_config(self, viz_data: pd.DataFrame, chart_info: Dict, 
+                                query: str, groq_client) -> Dict[str, Any]:
+        """
+        PHASE 4: Renderer
+        Generate chart configuration (Plotly-compatible JSON) from the prepared data.
+        """
+        import sys as _sys
+        
+        chart_type = chart_info['chart_type']
+        x_col = chart_info['x_col']
+        y_col = chart_info['y_col']
+        
+        if viz_data is None or len(viz_data) == 0:
+            return self._empty_chart_config(chart_type, "No data available")
+        
+        cols = viz_data.columns.tolist()
+        
+        # Ensure we have valid columns
+        if x_col not in cols:
+            x_col = cols[0]
+        if y_col not in cols and len(cols) > 1:
+            y_col = cols[1]
+        elif y_col not in cols:
+            y_col = cols[0]
+        
+        try:
+            # Build labels and data based on chart type
+            if chart_type in ['bar', 'pie', 'donut', 'line']:
+                labels = [str(x)[:40] for x in viz_data[x_col].tolist()]
+                
+                # Get numeric values
+                if y_col in viz_data.columns and y_col != x_col:
+                    data = viz_data[y_col].tolist()
+                else:
+                    # If y_col is same as x_col or not found, use counts
+                    data = [1] * len(labels)
+                
+                # Clean data - ensure all values are JSON-serializable numbers
+                data = [round(float(v), 2) if pd.notna(v) and isinstance(v, (int, float, np.number)) else 0 for v in data]
+                
+                # Generate insights
+                if data:
+                    max_idx = data.index(max(data))
+                    min_idx = data.index(min(data))
+                    avg_val = sum(data) / len(data)
+                    insights = [
+                        f"Highest: {labels[max_idx]} ({data[max_idx]:,.2f})",
+                        f"Lowest: {labels[min_idx]} ({data[min_idx]:,.2f})",
+                        f"Average: {avg_val:,.2f}"
+                    ]
+                else:
+                    insights = []
+                
+                config = {
+                    'chart_type': chart_type,
+                    'title': self._generate_chart_title(query, x_col, y_col),
+                    'labels': labels,
+                    'datasets': [{
+                        'label': str(y_col),
+                        'data': data,
+                        'insight': insights[0] if insights else ''
+                    }],
+                    'x_axis_label': str(x_col),
+                    'y_axis_label': str(y_col),
+                    'insights': insights
+                }
+            
+            elif chart_type == 'scatter':
+                # For scatter, we need x,y pairs
+                x_vals = viz_data[x_col].tolist()
+                y_vals = viz_data[y_col].tolist() if y_col in viz_data.columns else x_vals
+                
+                scatter_data = []
+                for x, y in zip(x_vals, y_vals):
+                    if pd.notna(x) and pd.notna(y):
+                        scatter_data.append({
+                            'x': round(float(x), 2) if isinstance(x, (int, float, np.number)) else 0,
+                            'y': round(float(y), 2) if isinstance(y, (int, float, np.number)) else 0
+                        })
+                
+                # Calculate correlation if possible
+                try:
+                    corr = viz_data[x_col].corr(viz_data[y_col])
+                    corr_insight = f"Correlation: {corr:.3f}"
+                except:
+                    corr_insight = "Correlation: N/A"
+                
+                config = {
+                    'chart_type': 'scatter',
+                    'title': self._generate_chart_title(query, x_col, y_col),
+                    'labels': [],
+                    'datasets': [{
+                        'label': f'{x_col} vs {y_col}',
+                        'data': scatter_data[:100],  # Limit to 100 points
+                        'insight': corr_insight
+                    }],
+                    'x_axis_label': str(x_col),
+                    'y_axis_label': str(y_col),
+                    'insights': [corr_insight, f"Showing {len(scatter_data[:100])} data points"]
+                }
+            
+            elif chart_type == 'histogram':
+                # For histogram, compute bins
+                values = viz_data[x_col].dropna()
+                if len(values) > 0:
+                    counts, bin_edges = np.histogram(values, bins=10)
+                    labels = [f"{bin_edges[i]:.1f}-{bin_edges[i+1]:.1f}" for i in range(len(counts))]
+                    data = [int(c) for c in counts]
+                else:
+                    labels, data = [], []
+                
+                config = {
+                    'chart_type': 'histogram',
+                    'title': f'Distribution of {x_col}',
+                    'labels': labels,
+                    'datasets': [{
+                        'label': 'Frequency',
+                        'data': data,
+                        'insight': f"Total: {sum(data)} values"
+                    }],
+                    'x_axis_label': str(x_col),
+                    'y_axis_label': 'Frequency',
+                    'insights': [
+                        f"Mean: {values.mean():.2f}" if len(values) > 0 else "No data",
+                        f"Std Dev: {values.std():.2f}" if len(values) > 0 else ""
+                    ]
+                }
+            
+            else:
+                config = self._empty_chart_config(chart_type, "Unknown chart type")
+            
+            _sys.stderr.write(f"✅ Phase 4 - Chart config generated\n")
+            _sys.stderr.write(f"   Labels: {len(config.get('labels', []))}\n")
+            _sys.stderr.write(f"   Data points: {len(config.get('datasets', [{}])[0].get('data', []))}\n")
+            _sys.stderr.flush()
+            
+            return config
+            
+        except Exception as e:
+            _sys.stderr.write(f"❌ Phase 4 - Config generation error: {e}\n")
+            _sys.stderr.flush()
+            return self._empty_chart_config(chart_type, str(e))
+    
+    def _generate_chart_title(self, query: str, x_col: str, y_col: str) -> str:
+        """Generate a descriptive chart title"""
+        query_lower = query.lower()
+        
+        # Try to extract intent from query
+        if 'top' in query_lower:
+            return f"Top {y_col} by {x_col}"
+        elif 'distribution' in query_lower:
+            return f"Distribution of {x_col}"
+        elif 'vs' in query_lower or 'versus' in query_lower:
+            return f"{x_col} vs {y_col}"
+        elif 'by' in query_lower:
+            return f"{y_col} by {x_col}"
+        elif 'relation' in query_lower:
+            return f"Relationship: {x_col} and {y_col}"
+        else:
+            return f"{y_col} by {x_col}"
+    
+    def _empty_chart_config(self, chart_type: str, message: str) -> Dict[str, Any]:
+        """Return an empty chart configuration with error message"""
+        return {
+            'chart_type': chart_type,
+            'title': 'Chart Error',
+            'labels': [],
+            'datasets': [{'label': 'No Data', 'data': [], 'insight': message}],
+            'x_axis_label': '',
+            'y_axis_label': '',
+            'insights': [message]
+        }
+    
     def _generate_visualization(self, df: pd.DataFrame, query: str, 
                                 groq_client) -> Dict[str, Any]:
         """
-        Generate visualization data and configuration.
+        Main visualization pipeline using the 4-phase architecture.
         
-        Returns:
-            Dict with chart configuration, data, and insights
+        Phase 1: Data Analyst - LLM writes Pandas code to prepare data
+        Phase 2: Execution Sandbox - Run code, get clean DataFrame
+        Phase 3: Visualization Architect - Heuristic chart selection
+        Phase 4: Renderer - Generate chart JSON config
         """
+        import sys as _sys
+        
+        _sys.stderr.write(f"\n{'='*60}\n")
+        _sys.stderr.write(f"📊 VISUALIZATION PIPELINE START\n")
+        _sys.stderr.write(f"   Query: {query}\n")
+        _sys.stderr.write(f"{'='*60}\n")
+        _sys.stderr.flush()
+        
         try:
-            # Determine the best chart type
-            chart_info = self._determine_chart_type(df, query)
-            chart_type = chart_info['chart_type']
+            # ============================================================
+            # PHASE 1: Data Analyst - Generate Pandas code for data prep
+            # ============================================================
+            viz_code = self._generate_viz_data_code(df, query, groq_client)
             
-            # Get column metadata for the LLM
-            column_metadata = self._get_column_metadata(df)
+            # ============================================================
+            # PHASE 2: Execution Sandbox - Execute code, get viz_data
+            # ============================================================
+            viz_data = self._execute_viz_code(df, viz_code)
             
-            # Find target column from query
-            target_col = self._find_column_from_query(df, query)
+            # If Phase 2 failed, try a simpler fallback
+            if viz_data is None:
+                _sys.stderr.write("⚠️ Phase 2 failed, using fallback data prep\n")
+                _sys.stderr.flush()
+                viz_data = self._fallback_data_prep(df, query)
             
-            # Pre-compute some useful statistics for the LLM
-            value_counts_info = ""
-            if target_col:
-                unique_count = df[target_col].nunique()
-                if unique_count <= 20:
-                    vc = df[target_col].value_counts().head(10)
-                    value_counts_info = f"\nVALUE COUNTS for '{target_col}' column:\n{vc.to_string()}\n"
+            # ============================================================
+            # PHASE 3: Visualization Architect - Select chart type
+            # ============================================================
+            chart_info = self._select_chart_type(viz_data, query)
             
-            # List all column names explicitly
-            columns_list = ", ".join([f"'{c}'" for c in df.columns.tolist()])
+            # ============================================================
+            # PHASE 4: Renderer - Generate chart config
+            # ============================================================
+            chart_config = self._generate_chart_config(viz_data, chart_info, query, groq_client)
             
-            # Create a prompt to generate the visualization data
-            viz_prompt = f"""You are a data visualization expert. Generate the data and configuration for a chart.
-
-AVAILABLE COLUMNS: {columns_list}
-
-DATASET INFORMATION:
-{column_metadata}
-{value_counts_info}
-SAMPLE DATA (first 5 rows):
-{df.head(5).to_string()}
-
-USER REQUEST: "{query}"
-{f"DETECTED TARGET COLUMN: '{target_col}'" if target_col else ""}
-
-SELECTED CHART TYPE: {chart_type}
-REASONING: {chart_info['reasoning']}
-
-IMPORTANT: 
-- If user asks for "distribution of X" or "count of X", use value_counts (count how many of each unique value)
-- Match column names EXACTLY as shown in AVAILABLE COLUMNS (case-sensitive)
-- For pie/bar charts showing counts, labels = unique values, data = count of each value
-
-TASK: Generate a JSON configuration for this visualization. Return ONLY valid JSON, no explanations.
-
-The JSON must follow this EXACT structure based on chart type:
-
-For BAR/PIE/DONUT charts:
-{{
-    "chart_type": "{chart_type}",
-    "title": "Descriptive title for the chart",
-    "labels": ["Category1", "Category2", ...],
-    "datasets": [{{
-        "label": "Dataset name",
-        "data": [value1, value2, ...],
-        "insight": "Key insight about this data"
-    }}],
-    "x_axis_label": "X axis label",
-    "y_axis_label": "Y axis label",
-    "insights": ["Key insight 1", "Key insight 2", "Key insight 3"]
-}}
-
-For LINE charts:
-{{
-    "chart_type": "line",
-    "title": "Descriptive title",
-    "labels": ["Point1", "Point2", ...],
-    "datasets": [{{
-        "label": "Series name",
-        "data": [value1, value2, ...],
-        "insight": "Trend insight"
-    }}],
-    "x_axis_label": "X axis label",
-    "y_axis_label": "Y axis label", 
-    "insights": ["Trend insight 1", "Trend insight 2"]
-}}
-
-For SCATTER charts:
-{{
-    "chart_type": "scatter",
-    "title": "Descriptive title",
-    "datasets": [{{
-        "label": "Dataset name",
-        "data": [{{"x": val1, "y": val2}}, ...],
-        "insight": "Correlation insight"
-    }}],
-    "x_axis_label": "X variable name",
-    "y_axis_label": "Y variable name",
-    "insights": ["Correlation insight", "Outlier observation"]
-}}
-
-For HISTOGRAM charts:
-{{
-    "chart_type": "histogram",
-    "title": "Descriptive title",
-    "labels": ["0-10", "10-20", ...],
-    "datasets": [{{
-        "label": "Frequency",
-        "data": [count1, count2, ...],
-        "insight": "Distribution insight"
-    }}],
-    "x_axis_label": "Value ranges",
-    "y_axis_label": "Frequency",
-    "insights": ["Distribution insight 1", "Distribution insight 2"]
-}}
-
-IMPORTANT RULES:
-1. Use ACTUAL data from the dataset, not placeholder values
-2. Limit to top 10-15 categories for readability
-3. Include 2-3 meaningful, specific insights based on the actual data values
-4. Round numeric values to 2 decimal places
-5. Make the title specific to what's being shown
-6. Insights should mention actual numbers/percentages from the data
-
-YOUR JSON RESPONSE:"""
-
-            # Get response from Groq
-            response = groq_client.generate_code(viz_prompt)
-            
-            # Debug log the raw response
-            import sys as _sys
-            _sys.stderr.write(f"\n📊 Visualization LLM Response (first 500 chars):\n{response[:500] if response else 'EMPTY'}\n")
+            _sys.stderr.write(f"\n{'='*60}\n")
+            _sys.stderr.write(f"✅ VISUALIZATION PIPELINE COMPLETE\n")
+            _sys.stderr.write(f"{'='*60}\n\n")
             _sys.stderr.flush()
-            
-            # Check if response is empty
-            if not response or not response.strip():
-                _sys.stderr.write("⚠️ Empty LLM response, using fallback chart generation\n")
-                _sys.stderr.flush()
-                chart_config = self._generate_fallback_chart(df, chart_type, query)
-            else:
-                # Clean and parse the JSON response
-                cleaned_response = response.strip()
-                
-                # Remove markdown code blocks if present (various formats)
-                if cleaned_response.startswith('```json'):
-                    cleaned_response = cleaned_response[7:]
-                elif cleaned_response.startswith('```'):
-                    cleaned_response = cleaned_response[3:]
-                # Handle case where response starts with just "json" (no backticks)
-                if cleaned_response.lower().startswith('json\n'):
-                    cleaned_response = cleaned_response[5:]
-                elif cleaned_response.lower().startswith('json '):
-                    cleaned_response = cleaned_response[5:]
-                elif cleaned_response.lower().startswith('json{'):
-                    cleaned_response = cleaned_response[4:]
-                    
-                if cleaned_response.endswith('```'):
-                    cleaned_response = cleaned_response[:-3]
-                
-                cleaned_response = cleaned_response.strip()
-                
-                # Find the JSON object - look for first { and last }
-                start_idx = cleaned_response.find('{')
-                end_idx = cleaned_response.rfind('}')
-                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                    cleaned_response = cleaned_response[start_idx:end_idx + 1]
-                
-                # Fix common JSON issues before parsing
-                # Remove trailing commas before } or ]
-                cleaned_response = re.sub(r',\s*}', '}', cleaned_response)
-                cleaned_response = re.sub(r',\s*]', ']', cleaned_response)
-                # Fix empty arrays with just whitespace
-                cleaned_response = re.sub(r'\[\s*\]', '[]', cleaned_response)
-                
-                _sys.stderr.write(f"📊 Cleaned JSON (first 200 chars): {cleaned_response[:200]}\n")
-                _sys.stderr.flush()
-                
-                # Parse the JSON
-                import json
-                try:
-                    chart_config = json.loads(cleaned_response)
-                    _sys.stderr.write("✅ JSON parsed successfully\n")
-                    _sys.stderr.flush()
-                except json.JSONDecodeError as e:
-                    _sys.stderr.write(f"⚠️ JSON parse error: {e}, using fallback\n")
-                    _sys.stderr.flush()
-                    chart_config = self._generate_fallback_chart(df, chart_type, query)
-            
-            # Validate and enhance the configuration
-            chart_config = self._validate_chart_config(chart_config, chart_type)
             
             return {
                 'success': True,
                 'result': chart_config,
                 'response_type': 'visualization',
-                'code': None,
+                'code': viz_code,
                 'error': None,
                 'chart_reasoning': chart_info['reasoning']
             }
@@ -923,6 +1156,10 @@ YOUR JSON RESPONSE:"""
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
+            _sys.stderr.write(f"❌ Visualization pipeline error: {e}\n")
+            _sys.stderr.write(f"{error_details}\n")
+            _sys.stderr.flush()
+            
             return {
                 'success': False,
                 'result': None,
@@ -931,6 +1168,110 @@ YOUR JSON RESPONSE:"""
                 'error': f"Failed to generate visualization: {str(e)}",
                 'error_details': error_details
             }
+    
+    def _fallback_data_prep(self, df: pd.DataFrame, query: str) -> pd.DataFrame:
+        """
+        Fallback data preparation when LLM-generated code fails.
+        Uses simple heuristics based on query keywords.
+        """
+        import sys as _sys
+        query_lower = query.lower()
+        
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+        
+        # Find columns mentioned in query
+        target_cols = self._find_columns_from_query(df, query)
+        
+        _sys.stderr.write(f"📊 Fallback data prep\n")
+        _sys.stderr.write(f"   Target columns: {target_cols}\n")
+        _sys.stderr.flush()
+        
+        try:
+            # Top N pattern
+            top_n = self._parse_top_n_query(query)
+            if top_n['is_top_n'] and numeric_cols:
+                sort_col = None
+                label_col = None
+                
+                for tc in target_cols:
+                    if tc in numeric_cols and not sort_col:
+                        sort_col = tc
+                    elif tc in categorical_cols and not label_col:
+                        label_col = tc
+                
+                if not sort_col:
+                    sort_col = numeric_cols[0]
+                if not label_col:
+                    # Find a name-like column
+                    for col in df.columns:
+                        if any(x in col.lower() for x in ['name', 'title', 'product', 'item']):
+                            label_col = col
+                            break
+                    if not label_col and categorical_cols:
+                        label_col = categorical_cols[0]
+                
+                n = min(top_n['n'], len(df))
+                if top_n['order'] == 'desc':
+                    viz_data = df.nlargest(n, sort_col)
+                else:
+                    viz_data = df.nsmallest(n, sort_col)
+                
+                if label_col:
+                    viz_data = viz_data[[label_col, sort_col]].reset_index(drop=True)
+                else:
+                    viz_data = viz_data[[sort_col]].reset_index()
+                
+                return viz_data
+            
+            # Two columns mentioned - relationship/groupby
+            if len(target_cols) >= 2:
+                col1, col2 = target_cols[0], target_cols[1]
+                
+                if col1 in categorical_cols and col2 in numeric_cols:
+                    viz_data = df.groupby(col1)[col2].mean().reset_index()
+                    return viz_data.head(15)
+                elif col1 in numeric_cols and col2 in categorical_cols:
+                    viz_data = df.groupby(col2)[col1].mean().reset_index()
+                    return viz_data.head(15)
+                elif col1 in numeric_cols and col2 in numeric_cols:
+                    viz_data = df[[col1, col2]].dropna().head(100)
+                    return viz_data
+            
+            # Single column mentioned
+            if target_cols:
+                col = target_cols[0]
+                if col in categorical_cols:
+                    viz_data = df[col].value_counts().head(10).reset_index()
+                    viz_data.columns = [col, 'count']
+                    return viz_data
+                elif col in numeric_cols:
+                    # Find a label column
+                    for lc in df.columns:
+                        if any(x in lc.lower() for x in ['name', 'title', 'product']):
+                            viz_data = df.nlargest(10, col)[[lc, col]].reset_index(drop=True)
+                            return viz_data
+                    viz_data = df[[col]].head(20)
+                    return viz_data
+            
+            # Default: first categorical column counts
+            if categorical_cols:
+                col = categorical_cols[0]
+                viz_data = df[col].value_counts().head(10).reset_index()
+                viz_data.columns = [col, 'count']
+                return viz_data
+            
+            # Last resort: first numeric column
+            if numeric_cols:
+                viz_data = df[numeric_cols[:2]].head(20)
+                return viz_data
+            
+            return df.head(10)
+            
+        except Exception as e:
+            _sys.stderr.write(f"❌ Fallback prep error: {e}\n")
+            _sys.stderr.flush()
+            return df.head(10)
     
     def _validate_chart_config(self, config: Dict, expected_type: str) -> Dict:
         """Validate and fix chart configuration"""
@@ -973,41 +1314,161 @@ YOUR JSON RESPONSE:"""
         
         return config
     
-    def _find_column_from_query(self, df: pd.DataFrame, query: str) -> Optional[str]:
+    def _find_columns_from_query(self, df: pd.DataFrame, query: str) -> List[str]:
         """
-        Find the most relevant column from the query text.
-        Uses fuzzy matching to find columns mentioned in the query.
+        Find ALL relevant columns mentioned in the query text.
+        Returns a list of column names found, in order of appearance.
         """
         query_lower = query.lower()
         columns = df.columns.tolist()
+        found_columns = []
+        found_positions = []  # Track position in query for ordering
         
-        # First, try exact match (case-insensitive)
+        # First pass: exact match (case-insensitive)
         for col in columns:
-            if col.lower() in query_lower:
-                return col
+            col_lower = col.lower()
+            pos = query_lower.find(col_lower)
+            if pos != -1 and col not in found_columns:
+                found_columns.append(col)
+                found_positions.append(pos)
         
-        # Try partial match
+        # Second pass: partial word match for columns not yet found
         for col in columns:
+            if col in found_columns:
+                continue
             col_words = col.lower().replace('_', ' ').replace('-', ' ').split()
             for word in col_words:
-                if len(word) > 2 and word in query_lower:
-                    return col
-        
-        # Try fuzzy matching if fuzzywuzzy is available
-        if FUZZYWUZZY_AVAILABLE:
-            query_words = re.findall(r'\b\w+\b', query_lower)
-            for word in query_words:
                 if len(word) > 2:
-                    matches = process.extractBests(word, [c.lower() for c in columns], 
-                                                   score_cutoff=70, limit=1)
-                    if matches:
-                        matched_col_lower = matches[0][0]
-                        # Find the original column name
-                        for col in columns:
-                            if col.lower() == matched_col_lower:
-                                return col
+                    pos = query_lower.find(word)
+                    if pos != -1:
+                        found_columns.append(col)
+                        found_positions.append(pos)
+                        break
         
-        return None
+        # Third pass: fuzzy matching for remaining columns
+        if not found_columns:
+            try:
+                from rapidfuzz import process
+                query_words = query_lower.replace('_', ' ').replace('-', ' ').split()
+                for word in query_words:
+                    if len(word) > 3:
+                        matches = process.extractBests(word, [c.lower() for c in columns], 
+                                                       score_cutoff=75, limit=1)
+                        if matches:
+                            matched_col_lower = matches[0][0]
+                            for col in columns:
+                                if col.lower() == matched_col_lower and col not in found_columns:
+                                    pos = query_lower.find(word)
+                                    found_columns.append(col)
+                                    found_positions.append(pos)
+                                    break
+            except:
+                pass
+        
+        # Sort by position in query (earlier mentions first)
+        if found_positions:
+            sorted_pairs = sorted(zip(found_positions, found_columns))
+            found_columns = [col for _, col in sorted_pairs]
+        
+        return found_columns
+    
+    def _find_column_from_query(self, df: pd.DataFrame, query: str) -> Optional[str]:
+        """
+        Find the most relevant column from the query text.
+        Returns the first matched column.
+        """
+        columns = self._find_columns_from_query(df, query)
+        return columns[0] if columns else None
+    
+    def _parse_relationship_query(self, query: str) -> tuple:
+        """
+        Parse queries like "X vs Y", "relation between X and Y", "X by Y"
+        Returns (x_term, y_term) or (None, None) if not a relationship query.
+        """
+        query_lower = query.lower()
+        
+        # Patterns for relationship queries
+        patterns = [
+            r'(\w+)\s+vs\.?\s+(\w+)',  # "X vs Y"
+            r'(\w+)\s+versus\s+(\w+)',  # "X versus Y"
+            r'relation(?:ship)?\s+(?:between\s+)?(\w+)\s+and\s+(\w+)',  # "relation between X and Y"
+            r'(\w+)\s+and\s+(\w+)\s+relation',  # "X and Y relation"
+            r'(\w+)\s+by\s+(\w+)',  # "X by Y"
+            r'(\w+)\s+against\s+(\w+)',  # "X against Y"
+            r'compare\s+(\w+)\s+(?:and|with|to)\s+(\w+)',  # "compare X and Y"
+            r'(\w+)\s+over\s+(\w+)',  # "X over Y"
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                return match.group(1), match.group(2)
+        
+        return None, None
+    
+    def _parse_top_n_query(self, query: str) -> Dict[str, Any]:
+        """
+        Parse queries like "top 5 products by price", "bottom 10 items with lowest stock"
+        Returns dict with: {is_top_n: bool, n: int, order: 'desc'/'asc', sort_column: str, label_column: str}
+        """
+        query_lower = query.lower()
+        result = {'is_top_n': False, 'n': 5, 'order': 'desc', 'sort_column': None, 'label_column': None}
+        
+        # Patterns for top/bottom N queries
+        top_patterns = [
+            r'top\s+(\d+)',                          # "top 5"
+            r'(\d+)\s+(?:most|highest|largest|best|top)',  # "5 most", "5 highest"
+            r'highest\s+(\d+)',                       # "highest 5"
+        ]
+        bottom_patterns = [
+            r'bottom\s+(\d+)',                        # "bottom 5"
+            r'(\d+)\s+(?:least|lowest|smallest|worst|bottom)',  # "5 lowest"
+            r'lowest\s+(\d+)',                        # "lowest 5"
+        ]
+        
+        # Check for top N patterns
+        for pattern in top_patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                result['is_top_n'] = True
+                result['n'] = int(match.group(1))
+                result['order'] = 'desc'  # Top = descending (highest first)
+                break
+        
+        # Check for bottom N patterns (overrides top if found)
+        for pattern in bottom_patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                result['is_top_n'] = True
+                result['n'] = int(match.group(1))
+                result['order'] = 'asc'  # Bottom = ascending (lowest first)
+                break
+        
+        # Also check for keywords without explicit number
+        if not result['is_top_n']:
+            if any(word in query_lower for word in ['top ', 'highest', 'most expensive', 'maximum', 'best']):
+                result['is_top_n'] = True
+                result['n'] = 5
+                result['order'] = 'desc'
+            elif any(word in query_lower for word in ['bottom ', 'lowest', 'cheapest', 'minimum', 'worst']):
+                result['is_top_n'] = True
+                result['n'] = 5
+                result['order'] = 'asc'
+        
+        # Determine sort column from keywords
+        if result['is_top_n']:
+            sort_keywords = {
+                'price': ['price', 'cost', 'expensive', 'cheap', 'costly'],
+                'stock': ['stock', 'inventory', 'quantity', 'available'],
+                'rating': ['rating', 'rated', 'score', 'review'],
+                'sales': ['sales', 'sold', 'revenue', 'selling'],
+            }
+            for col_hint, keywords in sort_keywords.items():
+                if any(kw in query_lower for kw in keywords):
+                    result['sort_column'] = col_hint
+                    break
+        
+        return result
     
     def _generate_fallback_chart(self, df: pd.DataFrame, chart_type: str, 
                                   query: str) -> Dict[str, Any]:
@@ -1020,31 +1481,191 @@ YOUR JSON RESPONSE:"""
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
         categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
         
-        # Try to find the column mentioned in the query
-        target_col = self._find_column_from_query(df, query)
-        _sys.stderr.write(f"📊 Fallback chart - Target column from query: {target_col}\n")
-        _sys.stderr.write(f"   Categorical cols: {categorical_cols}\n")
-        _sys.stderr.write(f"   Numeric cols: {numeric_cols[:5]}...\n")
+        # Find ALL columns mentioned in query
+        target_columns = self._find_columns_from_query(df, query)
+        
+        # Also parse relationship patterns like "X vs Y"
+        x_term, y_term = self._parse_relationship_query(query)
+        
+        _sys.stderr.write(f"📊 Fallback chart generation:\n")
+        _sys.stderr.write(f"   Chart type: {chart_type}\n")
+        _sys.stderr.write(f"   Target columns: {target_columns}\n")
+        _sys.stderr.write(f"   Relationship terms: x={x_term}, y={y_term}\n")
         _sys.stderr.flush()
         
         chart_config = {
             'chart_type': chart_type,
             'title': f'{chart_type.capitalize()} Chart - Data Overview',
             'labels': [],
-            'datasets': [{'label': 'Count', 'data': [], 'insight': ''}],
+            'datasets': [{'label': 'Value', 'data': [], 'insight': ''}],
             'x_axis_label': '',
             'y_axis_label': '',
             'insights': []
         }
         
         try:
-            # If we found a target column, use it
-            if target_col:
-                col_dtype = df[target_col].dtype
-                _sys.stderr.write(f"   Target column '{target_col}' dtype: {col_dtype}\n")
+            # CASE 0: Top N / Bottom N query (highest priority)
+            top_n_info = self._parse_top_n_query(query)
+            
+            if top_n_info['is_top_n']:
+                _sys.stderr.write(f"   Top N query detected: n={top_n_info['n']}, order={top_n_info['order']}\n")
                 _sys.stderr.flush()
                 
-                # Check if it's categorical or has few unique values (distribution/count query)
+                # Find the numeric column to sort by
+                sort_col = None
+                label_col = None
+                
+                # First, try to match sort_column hint to actual column
+                if top_n_info['sort_column']:
+                    for col in numeric_cols:
+                        if top_n_info['sort_column'] in col.lower():
+                            sort_col = col
+                            break
+                
+                # Also check target_columns for the sort column
+                if not sort_col and target_columns:
+                    for tc in target_columns:
+                        if tc in numeric_cols:
+                            sort_col = tc
+                            break
+                
+                # Fallback: use first numeric column
+                if not sort_col and numeric_cols:
+                    sort_col = numeric_cols[0]
+                
+                # Find label column (usually 'Name', 'Product', 'Title', or first categorical)
+                label_candidates = ['name', 'product', 'title', 'item', 'description']
+                for col in df.columns:
+                    if col.lower() in label_candidates or any(lc in col.lower() for lc in label_candidates):
+                        label_col = col
+                        break
+                
+                # Fallback to first categorical or index
+                if not label_col and categorical_cols:
+                    label_col = categorical_cols[0]
+                
+                if sort_col:
+                    ascending = (top_n_info['order'] == 'asc')
+                    n = min(top_n_info['n'], len(df))
+                    
+                    # Sort and take top/bottom N
+                    sorted_df = df.nlargest(n, sort_col) if not ascending else df.nsmallest(n, sort_col)
+                    
+                    if label_col:
+                        labels = [str(x)[:30] for x in sorted_df[label_col].tolist()]  # Truncate long names
+                    else:
+                        labels = [f"Item {i+1}" for i in range(len(sorted_df))]
+                    
+                    data = sorted_df[sort_col].tolist()
+                    data = [round(float(x), 2) if pd.notna(x) else 0 for x in data]
+                    
+                    order_word = "Highest" if not ascending else "Lowest"
+                    chart_config['labels'] = labels
+                    chart_config['datasets'][0]['data'] = data
+                    chart_config['datasets'][0]['label'] = sort_col
+                    chart_config['title'] = f'Top {n} {order_word} {sort_col}'
+                    chart_config['x_axis_label'] = label_col or 'Item'
+                    chart_config['y_axis_label'] = sort_col
+                    
+                    max_val = max(data) if data else 0
+                    min_val = min(data) if data else 0
+                    avg_val = sum(data) / len(data) if data else 0
+                    
+                    chart_config['insights'] = [
+                        f"Showing top {n} items by {order_word.lower()} {sort_col}",
+                        f"Highest: {labels[0] if labels else 'N/A'} ({max_val:,.2f})" if not ascending else f"Lowest: {labels[0] if labels else 'N/A'} ({min_val:,.2f})",
+                        f"Average among top {n}: {avg_val:,.2f}"
+                    ]
+                    
+                    _sys.stderr.write(f"   Generated Top N chart: {len(labels)} items by {sort_col}\n")
+                    _sys.stderr.flush()
+                    return chart_config
+            
+            # CASE 1: Relationship query with two columns (X vs Y)
+            x_col, y_col = None, None
+            
+            if len(target_columns) >= 2:
+                x_col, y_col = target_columns[0], target_columns[1]
+            elif x_term and y_term:
+                # Match terms to actual columns
+                for col in df.columns:
+                    col_lower = col.lower()
+                    if x_term in col_lower and not x_col:
+                        x_col = col
+                    elif y_term in col_lower and not y_col:
+                        y_col = col
+            
+            if x_col and y_col:
+                _sys.stderr.write(f"   Relationship mode: {x_col} vs {y_col}\n")
+                _sys.stderr.flush()
+                
+                x_is_numeric = x_col in numeric_cols
+                y_is_numeric = y_col in numeric_cols
+                
+                if not x_is_numeric or df[x_col].nunique() <= 20:
+                    # X is categorical or has few unique values - group by X, aggregate Y
+                    if y_is_numeric:
+                        grouped = df.groupby(x_col)[y_col].mean().sort_index()
+                        if len(grouped) > 15:
+                            grouped = grouped.head(15)
+                        
+                        chart_config['labels'] = [str(x) for x in grouped.index.tolist()]
+                        chart_config['datasets'][0]['data'] = [round(float(x), 2) for x in grouped.values.tolist()]
+                        chart_config['datasets'][0]['label'] = f'Average {y_col}'
+                        chart_config['title'] = f'{y_col} by {x_col}'
+                        chart_config['x_axis_label'] = x_col
+                        chart_config['y_axis_label'] = f'Average {y_col}'
+                        
+                        # Insights
+                        max_idx = grouped.idxmax()
+                        min_idx = grouped.idxmin()
+                        chart_config['insights'] = [
+                            f"Highest average {y_col}: {max_idx} ({grouped[max_idx]:,.2f})",
+                            f"Lowest average {y_col}: {min_idx} ({grouped[min_idx]:,.2f})",
+                            f"Overall average: {df[y_col].mean():,.2f}"
+                        ]
+                    else:
+                        # Both categorical - count combinations
+                        grouped = df.groupby(x_col).size().head(15)
+                        chart_config['labels'] = [str(x) for x in grouped.index.tolist()]
+                        chart_config['datasets'][0]['data'] = [int(x) for x in grouped.values.tolist()]
+                        chart_config['title'] = f'Count by {x_col}'
+                else:
+                    # Both numeric with many values - scatter or binned
+                    if chart_type == 'scatter':
+                        sample = df[[x_col, y_col]].dropna().head(100)
+                        chart_config['datasets'][0]['data'] = [
+                            {'x': round(float(row[x_col]), 2), 'y': round(float(row[y_col]), 2)}
+                            for _, row in sample.iterrows()
+                        ]
+                        chart_config['title'] = f'{x_col} vs {y_col}'
+                        chart_config['x_axis_label'] = x_col
+                        chart_config['y_axis_label'] = y_col
+                        corr = df[x_col].corr(df[y_col])
+                        chart_config['insights'] = [f"Correlation: {corr:.3f}"]
+                    else:
+                        # Bin X column for bar/line chart
+                        try:
+                            df_temp = df[[x_col, y_col]].dropna()
+                            df_temp['x_binned'] = pd.cut(df_temp[x_col], bins=10)
+                            grouped = df_temp.groupby('x_binned')[y_col].mean()
+                            
+                            chart_config['labels'] = [str(x) for x in grouped.index.tolist()]
+                            chart_config['datasets'][0]['data'] = [round(float(x), 2) for x in grouped.values.tolist()]
+                            chart_config['title'] = f'{y_col} by {x_col} Range'
+                        except:
+                            pass
+                
+                return chart_config
+            
+            # CASE 2: Single column query
+            target_col = target_columns[0] if target_columns else None
+            
+            if target_col:
+                col_dtype = df[target_col].dtype
+                _sys.stderr.write(f"   Single column mode: {target_col} (dtype: {col_dtype})\n")
+                _sys.stderr.flush()
+                
                 unique_count = df[target_col].nunique()
                 
                 if str(col_dtype) == 'object' or unique_count <= 20:
@@ -1415,21 +2036,6 @@ YOUR RESPONSE:"""
                 'response_type': 'data',
                 'intent': 'data'
             }
-    
-    def _looks_like_date(self, value: str) -> bool:
-        """Check if a string value looks like a date"""
-        date_patterns = [
-            r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
-            r'\d{2}/\d{2}/\d{4}',  # MM/DD/YYYY or DD/MM/YYYY
-            r'\d{2}-\d{2}-\d{4}',  # DD-MM-YYYY or MM-DD-YYYY
-            r'\d{4}/\d{2}/\d{2}',  # YYYY/MM/DD
-            r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)',  # Month names
-        ]
-        value_lower = str(value).lower()
-        for pattern in date_patterns:
-            if re.search(pattern, value_lower):
-                return True
-        return False
     
     def process_query_with_fuzzy_matching(self, df: pd.DataFrame, query: str, 
                                         groq_client) -> Dict[str, Any]:
